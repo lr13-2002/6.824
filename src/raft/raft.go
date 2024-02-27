@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -173,32 +172,6 @@ func (rf *Raft) setElectTimer() {
 	rf.timerElect.Reset(time.Millisecond * time.Duration(time_))
 }
 
-type AppendEntriesArgs struct {
-	TermId   int //leader 任期
-	LeaderId int //用来 follower 重定向到 leader
-}
-
-type AppendEntriesReply struct {
-	TermId int  //当前任期，leader 用来更新自己
-	Sucess bool //如果follower包含索引为 prevlogindex 和任期为 prevlogitem 的日志
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// log.Println(rf.me, "get", args.LeaderId)
-	defer func() {
-		reply.TermId = rf.currentTerm
-	}()
-	reply.Sucess = true
-	if args.TermId < rf.currentTerm {
-		reply.Sucess = false
-		return
-	}
-	rf.setElectTimer()
-	rf.toFollower()
-}
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -227,44 +200,28 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	defer func() {
 		reply.TermId = rf.currentTerm
+		rf.mu.Unlock()
 	}()
 	reply.VoteGranted = false
 	if args.TermId < rf.currentTerm || (args.TermId == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		return
 	}
 	rf.currentTerm = args.TermId
-
-	if args.TermId > rf.currentTerm {
-		rf.votedFor = -1
-		rf.toFollower()
-		return
-	}
-	// lastIndex := len(rf.logEntries) - 1
-	// if lastIndex == -1 || (rf.logEntries[lastIndex].TermId < args.TermId) ||
-	// 	(rf.logEntries[lastIndex].Index <= args.LastLogIndex && rf.logEntries[lastIndex].TermId == args.TermId) {
+	rf.toFollower()	
 	rf.setElectTimer()
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
+	// lastIndex := len(rf.logEntries) - 1
+	// if lastIndex == -1 || (rf.logEntries[lastIndex].TermId < args.TermId) ||
+	// 	(rf.logEntries[lastIndex].Index <= args.LastLogIndex && rf.logEntries[lastIndex].TermId == args.TermId) {
+
 	// return
 	// }
 }
 
-func (rf *Raft) Broadcast() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state == leader {
-		// log.Println(rf.me, "BroadCast")
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go rf.appendEntriesHandler(i)
-		}
-	}
-}
+
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -305,21 +262,67 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) appendEntriesHandler(server int) {
-	rf.mu.Lock()
-	if rf.state != leader {
-		return
-	}
-	rf.mu.Unlock()
-	args := AppendEntriesArgs{
-		TermId:   rf.currentTerm,
-		LeaderId: rf.me,
-	}
-	reply := AppendEntriesReply{}
-	rf.sendAppendEntries(server, &args, &reply)
-
+type AppendEntriesArgs struct {
+	TermId   int //leader 任期
+	LeaderId int //用来 follower 重定向到 leader
 }
 
+type AppendEntriesReply struct {
+	TermId int  //当前任期，leader 用来更新自己
+	Sucess bool //如果follower包含索引为 prevlogindex 和任期为 prevlogitem 的日志
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	DPrintf("%v 收到 %v 的心跳\n%v:%v\n%v:%v", rf.me, args.LeaderId, args.LeaderId, args.TermId, rf.me, rf.currentTerm)
+	defer func() {
+		reply.TermId = rf.currentTerm
+		rf.mu.Unlock()
+	}()
+	reply.Sucess = true
+	if args.TermId < rf.currentTerm {
+		reply.Sucess = false
+		return
+	}
+	if args.TermId > rf.currentTerm {
+		rf.currentTerm = args.TermId
+		rf.votedFor = -1
+		rf.toFollower()
+	}
+	rf.setElectTimer()
+}
+
+func (rf *Raft) Broadcast() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state == leader {
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			args := AppendEntriesArgs{
+				TermId:   rf.currentTerm,
+				LeaderId: rf.me,
+			}
+			go func(server int) {
+				reply := AppendEntriesReply{}
+				DPrintf("%v 发送心跳给 %v", rf.me, server)
+				ff := rf.sendAppendEntries(server, &args, &reply)
+				DPrintf("%v 接收 %v 的心跳回复", rf.me, server)
+				if !ff {
+					return 
+				}
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if !reply.Sucess && rf.state == leader {
+					DPrintf("leader 被发现 Term 较低\n%v: %v\n%v:%v", rf.me, rf.currentTerm, server, reply.TermId)
+					rf.votedFor = -1
+					rf.toFollower()
+				}
+			}(i)
+		}
+	}
+}
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -366,34 +369,26 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) toFollower() {
-	log.Println(rf.me, "跟随者")
+	DPrintf("%v 是跟随者\n", rf.me)
 	rf.state = follower
 
 }
 
 func (rf *Raft) toCandidate() {
-	if rf.state == candidate {
-		return
-	}
-	log.Println(rf.me, "候选者")
+	DPrintf("%v 是候选者\n", rf.me)
 	rf.currentTerm++
 	rf.state = candidate
 	rf.votedFor = rf.me
 }
 
 func (rf *Raft) toLeader() {
-	log.Println(rf.me, "领导")
 	rf.mu.Lock()
+	DPrintf("%v 是领导 当前任期 %v\n", rf.me, rf.currentTerm)
 	defer rf.mu.Unlock()
-
-	rf.state = leader
-
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
-
-	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.logEntries)
+	if rf.state != candidate {
+		return 
 	}
+	rf.state = leader
 	rf.timerHeartBeat.Reset(0)
 }
 func (rf *Raft) startElection() {
@@ -403,6 +398,7 @@ func (rf *Raft) startElection() {
 		if i == rf.me {
 			continue
 		}
+		LastTermId := rf.currentTerm
 		args := RequestVoteArgs{
 			TermId:       rf.currentTerm,
 			CandidateId:  rf.me,
@@ -415,7 +411,8 @@ func (rf *Raft) startElection() {
 			if ff {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				if reply.TermId == rf.currentTerm && rf.state == candidate {
+				if LastTermId == rf.currentTerm && rf.state == candidate {
+					DPrintf("%v 选举收到 %v 的回复 状态为 %v 当前有 %v 票", rf.me, id, reply.VoteGranted, voteNums)
 					if reply.VoteGranted {
 						voteNums++
 						if voteNums*2 > len(rf.peers) {
@@ -445,10 +442,10 @@ func (rf *Raft) ticker() {
 			if rf.killed() {
 				break
 			}
-			log.Println(rf.me, "准备重置选举")
+			DPrintf("%v 准备重置选举\n", rf.me)
 			rf.mu.Lock()
 			if rf.state != leader {
-				log.Println(rf.me, " ", rf.currentTerm, "开始选举")
+				DPrintf("%v 开始选举 当前任期为 %v\n", rf.me, rf.currentTerm + 1)
 				rf.startElection()
 			}
 			//重置选举计时器
@@ -458,18 +455,17 @@ func (rf *Raft) ticker() {
 			if rf.killed() {
 				break
 			}
-			log.Println(rf.me, "准备重置心跳")
 			rf.mu.Lock()
+			DPrintf("%v 准备重置心跳 当前任期为 %v 投给了 %v\n", rf.me, rf.currentTerm, rf.votedFor)
 			if rf.state == leader {
+				DPrintf("%v 发送心跳\n", rf.me)
 				go rf.Broadcast()
 			}
 			rf.timerHeartBeat.Reset(time.Duration(rf.timeoutHeartBeat) * time.Millisecond)
+			DPrintf("%v 重置心跳 当前任期为 %v 投给了 %v\n", rf.me, rf.currentTerm, rf.votedFor)
 			rf.mu.Unlock()
-		// default:
-		// 	log.Println(rf.me, "等着呢")
 		}
 	}
-	log.Println(rf.me, "DONE!!!!")
 }
 
 //
@@ -507,7 +503,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// defer File.Close()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	DPrintf("当前的机器为 %v\n", len(peers))
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
