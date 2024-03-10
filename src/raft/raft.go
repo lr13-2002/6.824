@@ -21,6 +21,8 @@ import (
 	//	"bytes"
 
 	"math/rand"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,7 +66,6 @@ const (
 type LogEntry struct {
 	Command interface{} //命令
 	TermId  int         //任期
-	Index   int         //下标
 }
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -72,7 +73,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
-
+	applyCh   chan ApplyMsg       // applied message
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -85,8 +86,9 @@ type Raft struct {
 	commitIndex int //将提交的日志的索引
 	lastApplied int //已经被提交到状态机的最后一个日志的索引
 	//leader 的可变状态
-	nextIndex  []int //下条发送到该机器的日志索引
-	matchIndex []int //将要复制给该机器日志的索引
+	nextIndex      []int //下条发送到该机器的日志索引
+	matchIndex     []int //将要复制给该机器日志的索引
+	sortMatchIndex []int //用来得到 commitId
 	//计时器
 	timerElect       *time.Timer //选举计时器
 	timerHeartBeat   *time.Timer //心跳计时器
@@ -208,20 +210,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.TermId < rf.currentTerm || (args.TermId == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		return
 	}
+	if rf.currentTerm < args.TermId {
+		rf.toFollower()
+		rf.votedFor = -1
+	}
 	rf.currentTerm = args.TermId
-	rf.toFollower()	
+	DPrintf("candidate:%v %v\nfollower: %v %v", args.LastLogIndex, args.LastLogTerm, len(rf.logEntries), rf.logEntries[len(rf.logEntries)-1].TermId)
+	if rf.logEntries[len(rf.logEntries)-1].TermId > args.LastLogTerm || (rf.logEntries[len(rf.logEntries)-1].TermId == args.LastLogTerm && args.LastLogIndex+1 < len(rf.logEntries)) {
+		return
+	}
+	rf.toFollower()
 	rf.setElectTimer()
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
-	// lastIndex := len(rf.logEntries) - 1
-	// if lastIndex == -1 || (rf.logEntries[lastIndex].TermId < args.TermId) ||
-	// 	(rf.logEntries[lastIndex].Index <= args.LastLogIndex && rf.logEntries[lastIndex].TermId == args.TermId) {
-
-	// return
-	// }
 }
-
-
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -263,8 +265,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 type AppendEntriesArgs struct {
-	TermId   int //leader 任期
-	LeaderId int //用来 follower 重定向到 leader
+	TermId         int        //leader 任期
+	LeaderId       int        //用来 follower 重定向到 leader
+	PrevLogIndex   int        //前继日志记录的索引
+	PrevLogItem    int        //前继日志记录的任期
+	LogEntry       []LogEntry //日志记录
+	LeaderCommitId int        //leader 的 commitIndex
 }
 
 type AppendEntriesReply struct {
@@ -274,9 +280,10 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	DPrintf("%v 收到 %v 的心跳\n%v:%v\n%v:%v", rf.me, args.LeaderId, args.LeaderId, args.TermId, rf.me, rf.currentTerm)
+	DPrintf("%v 收到 %v 的心跳\n%v:%v\n%v:%v\n%v Log: %v", rf.me, args.LeaderId, args.LeaderId, args.TermId, rf.me, rf.currentTerm, rf.me, getNumberLog(rf.logEntries))
 	defer func() {
 		reply.TermId = rf.currentTerm
+		DPrintf("%v 回复 %v: %v", rf.me, args.LeaderId, reply)
 		rf.mu.Unlock()
 	}()
 	reply.Sucess = true
@@ -289,6 +296,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.toFollower()
 	}
+
+	ff := false
+	if args.PrevLogIndex < len(rf.logEntries) {
+		DPrintf("PrevLogTerm: %v, TermId: %v", rf.logEntries[args.PrevLogIndex].TermId, args.PrevLogItem)
+		if rf.logEntries[args.PrevLogIndex].TermId != args.PrevLogItem {
+			reply.Sucess = false
+			return
+		}
+		var i int
+		fg := true
+		for i = 0; i < len(args.LogEntry) && args.PrevLogIndex+i+1 < len(rf.logEntries); i++ {
+			fg = false
+			if args.LogEntry[i] != rf.logEntries[args.PrevLogIndex+i+1] {
+				ff = true
+				break
+			}
+		}
+		if fg && len(rf.logEntries) != 0 {
+			ff = true
+		}
+	} else {
+		reply.Sucess = false
+		return
+	}
+	DPrintf("PrevLogIndex:%v  PrevLogItem:%v  LogEntry:%v  LeaderCommitId:%v\n %v:%v", args.PrevLogIndex, args.PrevLogItem, getNumberLog(args.LogEntry), args.LeaderCommitId, rf.me, getNumberLog(rf.logEntries))
+	if ff {
+		rf.logEntries = append(rf.logEntries[:args.PrevLogIndex+1], args.LogEntry...)
+	}
+	DPrintf("%v: %v", rf.me, getNumberLog(rf.logEntries))
+	nowCommitIndex := args.LeaderCommitId
+	if nowCommitIndex > len(rf.logEntries)-1 {
+		nowCommitIndex = len(rf.logEntries) - 1
+	}
+
+	if rf.commitIndex < nowCommitIndex {
+		rf.commitIndex = nowCommitIndex
+		go rf.Apply()
+	}
 	rf.setElectTimer()
 }
 
@@ -300,29 +345,25 @@ func (rf *Raft) Broadcast() {
 			if i == rf.me {
 				continue
 			}
-			args := AppendEntriesArgs{
-				TermId:   rf.currentTerm,
-				LeaderId: rf.me,
-			}
-			go func(server int) {
-				reply := AppendEntriesReply{}
-				DPrintf("%v 发送心跳给 %v", rf.me, server)
-				ff := rf.sendAppendEntries(server, &args, &reply)
-				DPrintf("%v 接收 %v 的心跳回复", rf.me, server)
-				if !ff {
-					return 
-				}
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if !reply.Sucess && rf.state == leader {
-					DPrintf("leader 被发现 Term 较低\n%v: %v\n%v:%v", rf.me, rf.currentTerm, server, reply.TermId)
-					rf.votedFor = -1
-					rf.toFollower()
-				}
-			}(i)
+			go rf.AppendEntriesToFollower(i)
 		}
 	}
 }
+
+func (rf *Raft) Apply() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		DPrintf("%v 提交 %v", rf.me, hashToNumber(rf.logEntries[rf.lastApplied].Command))
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logEntries[rf.lastApplied].Command,
+			CommandIndex: rf.lastApplied,
+		}
+	}
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -331,7 +372,7 @@ func (rf *Raft) Broadcast() {
 // command will ever be committed to the Raft log, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
-//
+
 // the first return value is the index that the command will appear at
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
@@ -343,8 +384,102 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	if rf.state != leader {
+		isLeader = false
+		return index, term, isLeader
+	}
+	DPrintf("%v 接收到 %v", rf.me, hashToNumber(command))
+	index = len(rf.logEntries)
+	newEntry := LogEntry{command, term}
+	rf.logEntries = append(rf.logEntries, newEntry)
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go rf.AppendEntriesToFollower(i)
+	}
 	return index, term, isLeader
+}
+
+func (rf *Raft) GetLog(index int) []LogEntry {
+	newLog := make([]LogEntry, 0)
+	for i := index; i < len(rf.logEntries); i++ {
+		newLog = append(newLog, rf.logEntries[i])
+	}
+	return newLog
+}
+
+func (rf *Raft) AppendEntriesToFollower(server int) {
+	defer func() {
+		if !rf.killed() {
+			rf.mu.Unlock()
+		}
+	}()
+	lastIndex := len(rf.logEntries) - 1
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state != leader || lastIndex != len(rf.logEntries) - 1 {
+			return
+		}
+		lastNextIndex := rf.nextIndex[server]
+		DPrintf("%v 发送给 %v nextIndex: %v LogEntry: %v", rf.me, server, rf.nextIndex[server], getNumberLog(rf.logEntries))
+		args := AppendEntriesArgs{
+			TermId:         rf.currentTerm,
+			LeaderId:       rf.me,
+			PrevLogIndex:   rf.nextIndex[server] - 1,
+			PrevLogItem:    rf.logEntries[rf.nextIndex[server]-1].TermId,
+			LogEntry:       rf.GetLog(rf.nextIndex[server]),
+			LeaderCommitId: rf.commitIndex,
+		}
+		rf.mu.Unlock()
+		reply := AppendEntriesReply{}
+		ff := rf.sendAppendEntries(server, &args, &reply)
+		if !ff {
+			continue
+		}
+		rf.mu.Lock()
+		if rf.state != leader || args.TermId != rf.currentTerm {
+			return
+		}
+		DPrintf("%v 收到 %v 心跳回复 reply: %v", rf.me, server, reply)
+		if reply.TermId > rf.currentTerm {
+			DPrintf("leader 被发现 Term 较低\n%v: %v\n%v:%v", rf.me, rf.currentTerm, server, reply.TermId)
+			rf.votedFor = -1
+			rf.toFollower()
+			return
+		}
+		if reply.Sucess {
+			if rf.matchIndex[server] < lastIndex {
+				rf.matchIndex[server] = lastIndex
+			}
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+			break
+		} else if rf.nextIndex[server] == lastNextIndex {
+			rf.nextIndex[server] -= 1
+		} else {
+			return
+		}
+		rf.mu.Unlock()
+	}
+	if rf.killed() {
+		return
+	}
+	copy(rf.sortMatchIndex, rf.matchIndex)
+	sort.Slice(rf.sortMatchIndex, func(i, j int) bool {
+		return rf.sortMatchIndex[i] < rf.sortMatchIndex[j]
+	})
+	minMatchIndex := rf.sortMatchIndex[len(rf.sortMatchIndex)/2+1]
+	if minMatchIndex > len(rf.logEntries)-1 {
+		minMatchIndex = len(rf.logEntries) - 1
+	}
+	DPrintf("%v 发送 %v 完毕, minMatchIndex: %v commitIndex: %v", rf.me, server, minMatchIndex, rf.commitIndex)
+	if minMatchIndex > rf.commitIndex {
+		rf.commitIndex = minMatchIndex
+		go rf.Apply()
+	}
 }
 
 //
@@ -371,7 +506,6 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) toFollower() {
 	DPrintf("%v 是跟随者\n", rf.me)
 	rf.state = follower
-
 }
 
 func (rf *Raft) toCandidate() {
@@ -381,14 +515,51 @@ func (rf *Raft) toCandidate() {
 	rf.votedFor = rf.me
 }
 
+func hashToNumber(value interface{}) string {
+	switch value_type := value.(type) {
+	case int:
+		{
+			return strconv.Itoa(value_type)
+		}
+	case string:
+		{
+			return value.(string)
+		}
+	default:
+		{
+			panic("interface type is not string or int")
+		}
+	}
+
+}
+
+type NumberLog struct {
+	Command string
+	TermId  int
+}
+
+func getNumberLog(Log []LogEntry) []NumberLog {
+	var returnLog []NumberLog
+	for _, i := range Log {
+		returnLog = append(returnLog, NumberLog{hashToNumber(i.Command), i.TermId})
+	}
+	return returnLog
+}
+
 func (rf *Raft) toLeader() {
 	rf.mu.Lock()
-	DPrintf("%v 是领导 当前任期 %v\n", rf.me, rf.currentTerm)
 	defer rf.mu.Unlock()
 	if rf.state != candidate {
-		return 
+		return
 	}
+	DPrintf("%v 是领导 当前任期 %v len: %v\n", rf.me, rf.currentTerm, len(rf.logEntries))
 	rf.state = leader
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.sortMatchIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = len(rf.logEntries)
+	}
 	rf.timerHeartBeat.Reset(0)
 }
 func (rf *Raft) startElection() {
@@ -402,7 +573,7 @@ func (rf *Raft) startElection() {
 		args := RequestVoteArgs{
 			TermId:       rf.currentTerm,
 			CandidateId:  rf.me,
-			LastLogIndex: rf.logEntries[len(rf.logEntries)-1].Index,
+			LastLogIndex: len(rf.logEntries) - 1,
 			LastLogTerm:  rf.logEntries[len(rf.logEntries)-1].TermId,
 		}
 		go func(id int) {
@@ -445,7 +616,7 @@ func (rf *Raft) ticker() {
 			DPrintf("%v 准备重置选举\n", rf.me)
 			rf.mu.Lock()
 			if rf.state != leader {
-				DPrintf("%v 开始选举 当前任期为 %v\n", rf.me, rf.currentTerm + 1)
+				DPrintf("%v 开始选举 当前任期为 %v\n", rf.me, rf.currentTerm+1)
 				rf.startElection()
 			}
 			//重置选举计时器
@@ -484,23 +655,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
+	rf.applyCh = applyCh
 	rf.me = me
 	rf.state = follower
 	rf.logEntries = make([]LogEntry, 0)
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.timeoutHeartBeat = 150
+	rf.timeoutHeartBeat = 100
 	rf.timeoutElect = 300
+	rf.state = follower
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.timerHeartBeat = time.NewTimer(time.Duration(rf.timeoutHeartBeat) * time.Millisecond)
 	rf.timerElect = time.NewTimer(time.Duration(rf.timeoutElect+rand.Intn(1000)) * time.Millisecond)
-	rf.logEntries = append(rf.logEntries, LogEntry{-1, 0, -1})
+	rf.logEntries = append(rf.logEntries, LogEntry{-1, 0})
 	// Your initialization code here (2A, 2B, 2C).
-	// File, err := os.Open("2A.txt")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// log.SetOutput(File)
-	// defer File.Close()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	DPrintf("当前的机器为 %v\n", len(peers))
