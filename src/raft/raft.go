@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -27,7 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -119,12 +120,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logEntries)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -136,17 +138,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var logEntries []LogEntry
+	if d.Decode(&currentTerm) != nil {
+		panic(d.Decode(&currentTerm))
+	} else if d.Decode(&votedFor) != nil {
+		panic(d.Decode(&votedFor))
+	} else if d.Decode(&logEntries) != nil {
+		panic(d.Decode(&logEntries))
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.logEntries = logEntries
 }
 
 //
@@ -204,6 +209,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer func() {
 		reply.TermId = rf.currentTerm
+		rf.persist()
 		rf.mu.Unlock()
 	}()
 	reply.VoteGranted = false
@@ -274,8 +280,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	TermId int  //当前任期，leader 用来更新自己
-	Sucess bool //如果follower包含索引为 prevlogindex 和任期为 prevlogitem 的日志
+	TermId    int //当前任期，leader 用来更新自己
+	SkipIndex int //优化日志复制
+	SkipTerm  int //优化日志复制
+	Sucess    bool //如果follower包含索引为 prevlogindex 和任期为 prevlogitem 的日志
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -283,14 +291,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("%v 收到 %v 的心跳\n%v:%v\n%v:%v\n%v Log: %v", rf.me, args.LeaderId, args.LeaderId, args.TermId, rf.me, rf.currentTerm, rf.me, getNumberLog(rf.logEntries))
 	defer func() {
 		reply.TermId = rf.currentTerm
+		rf.persist()
 		DPrintf("%v 回复 %v: %v", rf.me, args.LeaderId, reply)
 		rf.mu.Unlock()
 	}()
+	reply.SkipTerm = rf.currentTerm
 	reply.Sucess = true
+	reply.SkipIndex = args.PrevLogIndex
 	if args.TermId < rf.currentTerm {
 		reply.Sucess = false
 		return
 	}
+	rf.setElectTimer()
 	if args.TermId > rf.currentTerm {
 		rf.currentTerm = args.TermId
 		rf.votedFor = -1
@@ -301,22 +313,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex < len(rf.logEntries) {
 		DPrintf("PrevLogTerm: %v, TermId: %v", rf.logEntries[args.PrevLogIndex].TermId, args.PrevLogItem)
 		if rf.logEntries[args.PrevLogIndex].TermId != args.PrevLogItem {
+			reply.SkipTerm = rf.logEntries[args.PrevLogIndex].TermId
+			for rf.logEntries[reply.SkipIndex].TermId > args.PrevLogItem {
+				reply.SkipIndex--
+			}
 			reply.Sucess = false
 			return
 		}
 		var i int
-		fg := true
 		for i = 0; i < len(args.LogEntry) && args.PrevLogIndex+i+1 < len(rf.logEntries); i++ {
-			fg = false
 			if args.LogEntry[i] != rf.logEntries[args.PrevLogIndex+i+1] {
 				ff = true
 				break
 			}
 		}
-		if fg && len(rf.logEntries) != 0 {
+		if i < len(args.LogEntry) {
 			ff = true
 		}
 	} else {
+		reply.SkipIndex = len(rf.logEntries)
 		reply.Sucess = false
 		return
 	}
@@ -330,11 +345,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		nowCommitIndex = len(rf.logEntries) - 1
 	}
 
+	DPrintf("%v: LastCommitIndex: %v NowCommitIndex: %v LastApplied: %v", rf.me, rf.commitIndex, nowCommitIndex, rf.lastApplied)
 	if rf.commitIndex < nowCommitIndex {
 		rf.commitIndex = nowCommitIndex
+		
+	}
+	if rf.lastApplied < rf.commitIndex {
 		go rf.Apply()
 	}
-	rf.setElectTimer()
 }
 
 func (rf *Raft) Broadcast() {
@@ -353,7 +371,7 @@ func (rf *Raft) Broadcast() {
 func (rf *Raft) Apply() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	for rf.lastApplied < rf.commitIndex {
+	for !rf.killed() && rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		DPrintf("%v 提交 %v", rf.me, hashToNumber(rf.logEntries[rf.lastApplied].Command))
 		rf.applyCh <- ApplyMsg{
@@ -385,7 +403,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	defer func() {
+		rf.persist()
+		rf.mu.Unlock()
+	}()
 	term = rf.currentTerm
 	if rf.state != leader {
 		isLeader = false
@@ -395,12 +416,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.logEntries)
 	newEntry := LogEntry{command, term}
 	rf.logEntries = append(rf.logEntries, newEntry)
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		go rf.AppendEntriesToFollower(i)
-	}
+	rf.matchIndex[rf.me] = len(rf.logEntries) - 1
 	return index, term, isLeader
 }
 
@@ -418,13 +434,14 @@ func (rf *Raft) AppendEntriesToFollower(server int) {
 			rf.mu.Unlock()
 		}
 	}()
-	lastIndex := len(rf.logEntries) - 1
+
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state != leader || lastIndex != len(rf.logEntries) - 1 {
+		if rf.state != leader {
 			return
 		}
 		lastNextIndex := rf.nextIndex[server]
+		lastIndex := len(rf.logEntries) - 1
 		DPrintf("%v 发送给 %v nextIndex: %v LogEntry: %v", rf.me, server, rf.nextIndex[server], getNumberLog(rf.logEntries))
 		args := AppendEntriesArgs{
 			TermId:         rf.currentTerm,
@@ -448,17 +465,26 @@ func (rf *Raft) AppendEntriesToFollower(server int) {
 		if reply.TermId > rf.currentTerm {
 			DPrintf("leader 被发现 Term 较低\n%v: %v\n%v:%v", rf.me, rf.currentTerm, server, reply.TermId)
 			rf.votedFor = -1
+			rf.currentTerm = reply.TermId
 			rf.toFollower()
+			rf.persist()
 			return
 		}
 		if reply.Sucess {
 			if rf.matchIndex[server] < lastIndex {
 				rf.matchIndex[server] = lastIndex
+				rf.nextIndex[server] = rf.matchIndex[server] + 1
 			}
-			rf.nextIndex[server] = rf.matchIndex[server] + 1
 			break
 		} else if rf.nextIndex[server] == lastNextIndex {
-			rf.nextIndex[server] -= 1
+			DPrintf("nextIndex rollback\nlog: %v\n term: %v nextIndex: %v", getNumberLog(rf.logEntries), reply.SkipTerm, rf.nextIndex[server])
+			rf.nextIndex[server] = reply.SkipIndex
+			if rf.nextIndex[server]-1 < len(rf.logEntries) && rf.logEntries[rf.nextIndex[server]-1].TermId > reply.SkipTerm {
+				for rf.logEntries[rf.nextIndex[server]-1].TermId > reply.SkipTerm {
+					rf.nextIndex[server] -= 1
+				}
+				DPrintf("优化发生 nextIndex: %v", rf.nextIndex[server])
+			}
 		} else {
 			return
 		}
@@ -471,13 +497,15 @@ func (rf *Raft) AppendEntriesToFollower(server int) {
 	sort.Slice(rf.sortMatchIndex, func(i, j int) bool {
 		return rf.sortMatchIndex[i] < rf.sortMatchIndex[j]
 	})
-	minMatchIndex := rf.sortMatchIndex[len(rf.sortMatchIndex)/2+1]
+	minMatchIndex := rf.sortMatchIndex[len(rf.sortMatchIndex)/2]
 	if minMatchIndex > len(rf.logEntries)-1 {
 		minMatchIndex = len(rf.logEntries) - 1
 	}
 	DPrintf("%v 发送 %v 完毕, minMatchIndex: %v commitIndex: %v", rf.me, server, minMatchIndex, rf.commitIndex)
-	if minMatchIndex > rf.commitIndex {
+	if rf.logEntries[minMatchIndex].TermId == rf.currentTerm && minMatchIndex > rf.commitIndex {
 		rf.commitIndex = minMatchIndex
+	}
+	if rf.lastApplied < rf.commitIndex {
 		go rf.Apply()
 	}
 }
@@ -513,6 +541,7 @@ func (rf *Raft) toCandidate() {
 	rf.currentTerm++
 	rf.state = candidate
 	rf.votedFor = rf.me
+	rf.persist()
 }
 
 func hashToNumber(value interface{}) string {
@@ -540,9 +569,9 @@ type NumberLog struct {
 
 func getNumberLog(Log []LogEntry) []NumberLog {
 	var returnLog []NumberLog
-	for _, i := range Log {
-		returnLog = append(returnLog, NumberLog{hashToNumber(i.Command), i.TermId})
-	}
+	// for _, i := range Log {
+	// 	returnLog = append(returnLog, NumberLog{hashToNumber(i.Command), i.TermId})
+	// }
 	return returnLog
 }
 
@@ -594,6 +623,7 @@ func (rf *Raft) startElection() {
 					rf.currentTerm = reply.TermId
 					rf.toFollower()
 					rf.votedFor = -1
+					rf.persist()
 				}
 			}
 		}(i)

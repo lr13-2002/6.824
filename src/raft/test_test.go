@@ -811,11 +811,13 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2C): Figure 8 (unreliable)")
-
-	cfg.one(rand.Int()%10000, 1, true)
+	command := rand.Int()%10000
+	DPrintf("iters: %v", command)
+	cfg.one(command, 1, true)
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		DPrintf("iters: %v", iters)
 		if iters == 200 {
 			cfg.setlongreordering(true)
 		}
@@ -854,7 +856,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			cfg.connect(i)
 		}
 	}
-
+	DPrintf("????!!!!!!")
 	cfg.one(rand.Int()%10000, servers, true)
 
 	cfg.end()
@@ -878,12 +880,17 @@ func internalChurn(t *testing.T, unreliable bool) {
 	cfn := func(me int, ch chan []int) {
 		var ret []int
 		ret = nil
-		defer func() { ch <- ret }()
+		defer func() { 
+			DPrintf("defercfn: %v\n ret: %v", me, ret)
+			ch <- ret 
+			DPrintf("defer sucessful: %v", me)
+		}()
 		values := []int{}
 		for atomic.LoadInt32(&stop) == 0 {
 			x := rand.Int()
 			index := -1
 			ok := false
+			DPrintf("cfn: %v x: %v", me, x)
 			for i := 0; i < servers; i++ {
 				// try them all, maybe one of them is a leader
 				cfg.mu.Lock()
@@ -903,6 +910,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 				for _, to := range []int{10, 20, 50, 100, 200} {
 					nd, cmd := cfg.nCommitted(index)
 					if nd > 0 {
+						DPrintf("getcfn: %v %v", nd, cmd.(int))
 						if xx, ok := cmd.(int); ok {
 							if xx == x {
 								values = append(values, x)
@@ -912,12 +920,15 @@ func internalChurn(t *testing.T, unreliable bool) {
 						}
 						break
 					}
+					DPrintf("cfn%v sleep: %v", me, (time.Duration(to) * time.Millisecond).Seconds())
 					time.Sleep(time.Duration(to) * time.Millisecond)
 				}
 			} else {
+				DPrintf("cfn%v sleep: %v", me, (time.Duration(79+me*17) * time.Millisecond).Seconds())
 				time.Sleep(time.Duration(79+me*17) * time.Millisecond)
 			}
 		}
+		DPrintf("%v 跳出", me)
 		ret = values
 	}
 
@@ -929,6 +940,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 	}
 
 	for iters := 0; iters < 20; iters++ {
+		DPrintf("iters: %v", iters)
 		if (rand.Int() % 1000) < 200 {
 			i := rand.Int() % servers
 			cfg.disconnect(i)
@@ -966,10 +978,12 @@ func internalChurn(t *testing.T, unreliable bool) {
 	}
 
 	atomic.StoreInt32(&stop, 1)
-
+	DPrintf("first")
 	values := []int{}
 	for i := 0; i < ncli; i++ {
+		DPrintf("ready: %v", i)
 		vv := <-cha[i]
+		DPrintf("get: %v\n%v", i, vv)
 		if vv == nil {
 			t.Fatal("client failed")
 		}
@@ -977,11 +991,12 @@ func internalChurn(t *testing.T, unreliable bool) {
 	}
 
 	time.Sleep(RaftElectionTimeout)
-
-	lastIndex := cfg.one(rand.Int(), servers, true)
-
+	val := rand.Int()
+	lastIndex := cfg.one(val, servers, true)
+	DPrintf("lastIndex: %v", lastIndex)
 	really := make([]int, lastIndex+1)
 	for index := 1; index <= lastIndex; index++ {
+		DPrintf("one: %v", index)
 		v := cfg.wait(index, servers, -1)
 		if vi, ok := v.(int); ok {
 			really = append(really, vi)
@@ -989,8 +1004,9 @@ func internalChurn(t *testing.T, unreliable bool) {
 			t.Fatalf("not an int")
 		}
 	}
-
+	DPrintf("two")
 	for _, v1 := range values {
+		DPrintf("two: %v", v1)
 		ok := false
 		for _, v2 := range really {
 			if v1 == v2 {
@@ -1001,7 +1017,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 			cfg.t.Fatalf("didn't find a value")
 		}
 	}
-
+	DPrintf("there")
 	cfg.end()
 }
 

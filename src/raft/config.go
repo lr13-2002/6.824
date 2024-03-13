@@ -108,7 +108,7 @@ func (cfg *config) crash1(i int) {
 
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
-
+	DPrintf("%v crashed", i)
 	// a fresh persister, in case old instance
 	// continues to update the Persister.
 	// but copy old persister's content so that we always
@@ -282,6 +282,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	srv := labrpc.MakeServer()
 	srv.AddService(svc)
 	cfg.net.AddServer(i, srv)
+	DPrintf("%v start", i)
 }
 
 func (cfg *config) checkTimeout() {
