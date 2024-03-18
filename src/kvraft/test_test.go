@@ -1,16 +1,19 @@
 package kvraft
 
-import "6.824/porcupine"
-import "6.824/models"
-import "testing"
-import "strconv"
-import "time"
-import "math/rand"
-import "strings"
-import "sync"
-import "sync/atomic"
-import "fmt"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"6.824/models"
+	"6.824/porcupine"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -58,6 +61,7 @@ func Get(cfg *config, ck *Clerk, key string, log *OpLog, cli int) string {
 
 func Put(cfg *config, ck *Clerk, key string, value string, log *OpLog, cli int) {
 	start := time.Now().UnixNano()
+	DPrintf("test PUT key:%v, value:%v", key, value)
 	ck.Put(key, value)
 	end := time.Now().UnixNano()
 	cfg.op()
@@ -247,7 +251,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 		clnts[i] = make(chan int)
 	}
 	for i := 0; i < 3; i++ {
-		// log.Printf("Iteration %v\n", i)
+		DPrintf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
 		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
@@ -259,6 +263,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 			if !randomkeys {
 				Put(cfg, myck, strconv.Itoa(cli), last, opLog, cli)
 			}
+			DPrintf("done_clients: %v", atomic.LoadInt32(&done_clients))
 			for atomic.LoadInt32(&done_clients) == 0 {
 				var key string
 				if randomkeys {
@@ -267,9 +272,12 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 					key = strconv.Itoa(cli)
 				}
 				nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-				if (rand.Int() % 1000) < 500 {
+				randInt := rand.Int()
+				DPrintf("randInt: %v", randInt)
+				if (randInt % 1000) < 500 {
 					// log.Printf("%d: client new append %v\n", cli, nv)
 					Append(cfg, myck, key, nv, opLog, cli)
+					DPrintf("spawn_clients_and_wait key:%v, value:%v", key, nv)
 					if !randomkeys {
 						last = NextValue(last, nv)
 					}

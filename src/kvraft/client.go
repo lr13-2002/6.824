@@ -1,13 +1,20 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"strconv"
+	"time"
 
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId int
+	clerkId  int
+	reqId    int
 }
 
 func nrand() int64 {
@@ -21,6 +28,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clerkId = int(nrand())
+	ck.leaderId = 0
+	ck.reqId = 0
 	return ck
 }
 
@@ -39,7 +49,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	ck.reqId++
+	args := GetArgs{
+		Key:     key,
+		ReqId:   ck.reqId,
+		ClerkId: strconv.Itoa(ck.clerkId),
+	}
+	for {
+		reply := GetReply{}
+		DPrintf("ClerkId:%v Get发送 %v: %v", ck.clerkId, ck.leaderId, args)
+		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			time.Sleep(100 * time.Millisecond)
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			continue
+		}
+		DPrintf("%v 接收到 %v", ck.clerkId, reply)
+		if reply.Err == ErrWrongLeader || reply.Err == ErrTimeOut {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			if reply.Err == ErrTimeOut {
+				time.Sleep(100 * time.Millisecond)
+			}
+		} else if reply.Err == ErrNoKey {
+			return ""
+		} else {
+			DPrintf("ClerkId:%v Get接收到 %v: %v", ck.clerkId, key, reply.Value)
+			return reply.Value
+		}
+	}
 }
 
 //
@@ -54,9 +91,38 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.reqId++
+	args := PutAppendArgs{
+		Key:     key,
+		Value:   value,
+		Op:      op,
+		ReqId:   ck.reqId,
+		ClerkId: strconv.Itoa(ck.clerkId),
+	}
+	for {
+		
+		reply := PutAppendReply{}
+		DPrintf("ClerkId:%v %v发送 %v: Key:%v, Value:%v, ReqId:%v", ck.clerkId, op, ck.leaderId, args.Key, value, args.ReqId)
+		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+		if !ok {
+			time.Sleep(100 * time.Millisecond)
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			continue
+		}
+		DPrintf("ClerkId:%v %v接收到 %v", ck.clerkId, op, reply)
+		if reply.Err == ErrWrongLeader || reply.Err == ErrTimeOut {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			if reply.Err == ErrTimeOut {
+				time.Sleep(100 * time.Millisecond)
+			}
+		} else {
+			break
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
+	DPrintf("%v PUT接收到 key:%v, value:%v", ck.clerkId, key, value)
 	ck.PutAppend(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {

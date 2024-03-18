@@ -253,6 +253,7 @@ func (cfg *config) DisconnectClient(ck *Clerk, from []int) {
 
 // Shutdown a server by isolating it
 func (cfg *config) ShutdownServer(i int) {
+	DPrintf("ShutDown %v", i)
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
 
@@ -285,6 +286,7 @@ func (cfg *config) ShutdownServer(i int) {
 
 // If restart servers, first call ShutdownServer
 func (cfg *config) StartServer(i int) {
+	DPrintf("Start %v", i)
 	cfg.mu.Lock()
 
 	// a fresh set of outgoing ClientEnd names.
