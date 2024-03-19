@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -41,18 +42,31 @@ type KVServer struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
-
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	waitChan sync.Map
-	data     sync.Map
-	repId    sync.Map
+	waitChan map[int]chan Op
+	data     map[string]string
+	reqId    map[string]int
+	lastSnapShot int
 }
 
 func (kv *KVServer) IsPastReq(clerkId string, nowReqId int) bool {
-	reqId, ok := kv.repId.Load(clerkId)
-	return ok && reqId.(int) >= nowReqId
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	reqId, ok := kv.reqId[clerkId]
+	return ok && reqId >= nowReqId
+}
+
+func (kv *KVServer) GetWaitChan(index int) chan Op {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	ch, exist := kv.waitChan[index]
+	if !exist {
+		kv.waitChan[index] = make(chan Op, 1)
+		ch = kv.waitChan[index]
+	}
+	return ch
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -61,22 +75,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 	}
 	DPrintf("%v 接收到Get: Key:%v, ReqId:%v, ClerkId:%v", kv.me, args.Key, args.ReqId, args.ClerkId)
-	defer DPrintf("%v 发送 %v", kv.me, reply)
+	defer DPrintf("%v 发送Get给 %v,reply:%v", kv.me, args.ClerkId, reply)
 	reply.Err = OK
-
-	kv.mu.Lock()
 	index, _, isLeader := kv.rf.Start(Op{OpType: "Get", ReqId: args.ReqId, Key: args.Key, ClerkId: args.ClerkId})
-	kv.mu.Unlock()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	chAny, ok := kv.waitChan.Load(index)
-	if !ok {
-		chAny = make(chan Op, 1)
-		kv.waitChan.Store(index, chAny)
-	}
-	ch, _ := chAny.(chan Op)
+	ch := kv.GetWaitChan(index)
 	select {
 	case <-time.After(100 * time.Millisecond):
 		reply.Err = ErrTimeOut
@@ -86,11 +92,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = ErrWrongLeader
 			return
 		}
-		if value, ok := kv.data.Load(args.Key); ok {
-			reply.Value = value.(string)
+		kv.mu.Lock()
+		if value, ok := kv.data[args.Key]; ok {
+			reply.Value = value
 		} else {
 			reply.Err = ErrNoKey
 		}
+		kv.mu.Unlock()
 	}
 }
 
@@ -101,24 +109,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	defer DPrintf("%v 发送给%v: %v", kv.me, args.ClerkId, reply)
 	reply.Err = OK
-	kv.mu.Lock()
 	index, _, isLeader := kv.rf.Start(Op{OpType: args.Op, ReqId: args.ReqId, Key: args.Key, Value: args.Value, ClerkId: args.ClerkId})
-	kv.mu.Unlock()
-	DPrintf("%v 接收到PA: Key:%v, Value:%v, Op:%v, ReqId:%v, ClerkId:%v index:%v", kv.me, args.Key, args.Value, args.Op, args.ReqId, args.ClerkId, index)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	DPrintf("%v 接收到PA: Key:%v, Value:%v, Op:%v, ReqId:%v, ClerkId:%v index:%v", kv.me, args.Key, args.Value, args.Op, args.ReqId, args.ClerkId, index)
 
-	chAny, ok := kv.waitChan.Load(index)
-	if !ok {
-		chAny = make(chan Op, 1)
-		kv.waitChan.Store(index, chAny)
-	}
-	ch, ok := chAny.(chan Op)
-	if !ok {
-		panic("chAny transform error")
-	}
+	ch := kv.GetWaitChan(index)
 	select {
 	case <-time.After(100 * time.Millisecond):
 		reply.Err = ErrTimeOut
@@ -133,40 +131,67 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) ListenApply() {
 	for !kv.killed() {
-		val := <-kv.applyCh
-		if val.CommandValid {
-			ch, ok := kv.waitChan.Load(val.CommandIndex)
-			if !ok {
-				ch = make(chan Op, 1)
-				kv.waitChan.Store(val.CommandIndex, ch)
-			}
-			args := val.Command.(Op)
-			ch.(chan Op) <- args
-			DPrintf("ListenApply 接收到 kv_id:%v, 来自 %v 的请求:Key:%v, Value:%v, Op:%v, ReqId:%v index:%v", kv.me, args.ClerkId, args.Key, args.Value, args.OpType, args.ReqId, val.CommandIndex)
-			if kv.IsPastReq(args.ClerkId, args.ReqId) {
-				nowReqId, _ := kv.repId.Load(args.ClerkId)
-				DPrintf("kv_id:%v, 来自 %v 的请求已过期:Key:%v, Value:%v, Op:%v, ReqId:%v, nowReqId:%v", kv.me, args.ClerkId, args.Key, args.Value, args.OpType, args.ReqId, nowReqId)
-				continue
-			}
-			kv.repId.Store(args.ClerkId, args.ReqId)
-
-			if args.OpType == PutOp {
-				kv.mu.Lock()
-				kv.data.Store(args.Key, args.Value)
-				kv.mu.Unlock()
-				DPrintf("%v 已经 PutAppend 成功: %v:%v", kv.me, args.Key, args.Value)
-			} else if args.OpType == AppendOp {
-				kv.mu.Lock()
-				value, ok := kv.data.Load(args.Key)
-				if !ok {
-					value = ""
+		select {
+		case val := <-kv.applyCh:
+			if val.CommandValid {
+				if val.CommandIndex <= kv.lastSnapShot {
+					continue
 				}
-				kv.data.Store(args.Key, value.(string)+args.Value)
+				ch := kv.GetWaitChan(val.CommandIndex)
+				args := val.Command.(Op)
+				nowReqId, ok := kv.reqId[args.ClerkId]
+				if !ok {
+					nowReqId = -1
+				}
+				DPrintf("ListenApply 接收到 kv_id:%v, 来自 %v 的请求:Key:%v, Value:%v, Op:%v, ReqId:%v , nowReqId:%v, index:%v", kv.me, args.ClerkId, args.Key, args.Value, args.OpType, args.ReqId, nowReqId, val.CommandIndex)
+				if !kv.IsPastReq(args.ClerkId, args.ReqId) {
+					kv.mu.Lock()
+					if args.OpType == PutOp {
+						kv.data[args.Key] = args.Value
+					} else if args.OpType == AppendOp {
+						kv.data[args.Key] += args.Value
+					}
+					DPrintf("%v 已经 PutAppend 成功: %v:%v", kv.me, args.Key, kv.data[args.Key])
+					kv.reqId[args.ClerkId] = args.ReqId
+					kv.mu.Unlock()
+				}
+				if kv.rf.GetRaftSize() > kv.maxraftstate {
+					DPrintf("%v 发送快照 CommandIndex:%v, loglen:%v", kv.me, val.CommandIndex, kv.rf.LockGetLogLen())
+					kv.rf.Snapshot(val.CommandIndex, kv.PersistSnapShot())
+					kv.mu.Lock()
+					kv.lastSnapShot = val.CommandIndex
+					kv.mu.Unlock()
+				}
+				DPrintf("%v 写入 %v", kv.me, val.Command.(Op))
+				if len(ch) == 1 {
+					DPrintf("ch 中已有元素,可能会发生死锁")
+				}
+				ch <- args
+				DPrintf("%v 写入成功 %v", kv.me, val.Command.(Op))
+			} else if val.SnapshotValid {
+				kv.mu.Lock()
+				DPrintf("%v 接收到快照 val.SnapshotIndex:%v, kv.lastSnapShot:%v", kv.me, val.SnapshotIndex, kv.lastSnapShot)
+				if val.SnapshotIndex > kv.lastSnapShot {
+					kv.lastSnapShot = val.SnapshotIndex
+					kv.DecodeSnapShot(val.Snapshot)
+				}
 				kv.mu.Unlock()
-				DPrintf("%v 已经 PutAppend 成功: %v:%v", kv.me, args.Key, value.(string)+args.Value)
 			}
-			DPrintf("写入 %v", val.Command.(Op))
+		case <-time.After(100 * time.Millisecond):
 		}
+	}
+}
+
+func (kv *KVServer) InstallSnapshot() {
+	for !kv.killed() {
+		kv.mu.Lock()
+		lastSnapShot := kv.lastSnapShot
+		kv.mu.Unlock()
+		if kv.rf.GetRaftSize() > kv.maxraftstate {
+			DPrintf("%v 发送快照 CommandIndex:%v, loglen:%v", kv.me, lastSnapShot, kv.rf.LockGetLogLen())
+			kv.rf.Snapshot(lastSnapShot, kv.PersistSnapShot())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -190,6 +215,53 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) DecodeSnapShot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	DPrintf("%v 快照之前", kv.me)
+	DPrintf("data:")
+	for key, value := range kv.data {
+		DPrintf("%v~%v:%v", kv.me, key, value)
+	}
+	DPrintf("reqId:")
+	for key, value := range kv.reqId {
+		DPrintf("%v~%v:%v", kv.me, key, value)
+	}
+	var kvPersist map[string]string
+	var seqMap map[string]int
+	
+	if d.Decode(&kvPersist) == nil && d.Decode(&seqMap) == nil {
+		DPrintf("%v 快照之后", kv.me)
+		DPrintf("data:")
+		for key, value := range kvPersist {
+			DPrintf("%v~%v:%v", kv.me, key, value)
+		}
+		kv.data = kvPersist
+		DPrintf("reqId:")
+		for key, value := range seqMap {
+			DPrintf("%v~%v:%v", kv.me, key, value)
+		}
+		kv.reqId = seqMap
+	} else {
+		DPrintf("[Server(%v)] Failed to decode snapshot!!!", kv.me)
+	}
+}
+
+func (kv *KVServer) PersistSnapShot() []byte {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.reqId)
+	data := w.Bytes()
+	return data
 }
 
 //
@@ -219,7 +291,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.reqId = make(map[string]int)
+	kv.data = make(map[string]string)
+	kv.waitChan = make(map[int]chan Op)
+	kv.DecodeSnapShot(persister.ReadSnapshot())
+	kv.lastSnapShot = -1
 	// You may need initialization code here.
 	go kv.ListenApply()
 	return kv

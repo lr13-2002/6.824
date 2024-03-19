@@ -60,6 +60,7 @@ func (ck *Clerk) Get(key string) string {
 		DPrintf("ClerkId:%v Get发送 %v: %v", ck.clerkId, ck.leaderId, args)
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
 		if !ok {
+			DPrintf("ClerkId:%v Get发送网络有问题正在重试 %v: %v", ck.clerkId, ck.leaderId, args)
 			time.Sleep(100 * time.Millisecond)
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue
@@ -67,9 +68,6 @@ func (ck *Clerk) Get(key string) string {
 		DPrintf("%v 接收到 %v", ck.clerkId, reply)
 		if reply.Err == ErrWrongLeader || reply.Err == ErrTimeOut {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-			if reply.Err == ErrTimeOut {
-				time.Sleep(100 * time.Millisecond)
-			}
 		} else if reply.Err == ErrNoKey {
 			return ""
 		} else {
@@ -105,6 +103,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		DPrintf("ClerkId:%v %v发送 %v: Key:%v, Value:%v, ReqId:%v", ck.clerkId, op, ck.leaderId, args.Key, value, args.ReqId)
 		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
 		if !ok {
+			DPrintf("ClerkId:%v %v发送 %v网络有问题: Key:%v, Value:%v, ReqId:%v", ck.clerkId, op, ck.leaderId, args.Key, value, args.ReqId)
 			time.Sleep(100 * time.Millisecond)
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			continue

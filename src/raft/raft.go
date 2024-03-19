@@ -82,7 +82,7 @@ type LogEntry struct {
 	TermId  int         //任期
 }
 type Raft struct {
-	mu        sync.Mutex // Lock to protect shared access to this peer's state
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	applyMu   sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -132,6 +132,7 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) GetRaftSize() int {
 	return rf.persister.RaftStateSize()
 }
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -205,7 +206,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	// DPrintf("%v 接收到快照: %v %v %v", rf.me, index, snapshot, rf.lastApplied)
 	defer rf.mu.Unlock()
-	if rf.lastIncludedIndex >= index || rf.lastApplied < index {
+	if rf.lastIncludedIndex >= index || index > rf.lastApplied {
 		return
 	}
 	rf.lastIncludedItem = rf.logEntries[rf.GetRealIndex(index)].TermId
@@ -214,6 +215,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.logEntries = append(newLog, rf.logEntries[rf.GetRealIndex(index+1):]...)
 	// DPrintf("%v 快照之后的 log\n%v", rf.me, getNumberLog(rf.logEntries))
 	rf.lastIncludedIndex = index
+	if index > rf.commitIndex {
+		rf.commitIndex = index
+	}
+	if index > rf.lastApplied {
+		rf.lastApplied = index
+	}
 	rf.persist()
 	raftState := rf.persister.ReadRaftState()
 	rf.persister.SaveStateAndSnapshot(raftState, snapshot)
@@ -334,13 +341,13 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
+	DPrintf("%v 接收到 %v 的快照: %v, args.LastIncludedIndex:%v,rf.lastIncludedIndex:%v", rf.me, args.LeaderId, args, args.LastIncludedIndex, rf.lastIncludedIndex)
 	if args.TermId < rf.currentTerm || args.LastIncludedIndex <= rf.lastIncludedIndex {
 		reply.TermId = rf.currentTerm
 		rf.mu.Unlock()
 		return
 	}
 	rf.setElectTimer()
-	// DPrintf("%v 接收到 %v 的快照: %v", rf.me, args.LeaderId, args)
 	if args.TermId > rf.currentTerm {
 		rf.currentTerm = args.TermId
 		rf.votedFor = -1
@@ -350,17 +357,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	newLog := make([]LogEntry, 0)
 	newLog = append(newLog, LogEntry{-1, 0})
 	for i := args.LastIncludedIndex + 1; i < rf.GetLogLen(); i++ {
-		if rf.logEntries[rf.GetRealIndex(i)].TermId > args.LastIncludedItem {
-			newLog = append(newLog, rf.logEntries[rf.GetRealIndex(i)])
-		}
+		newLog = append(newLog, rf.logEntries[rf.GetRealIndex(i)])
 	}
 	rf.logEntries = newLog
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedItem = args.LastIncludedItem
-	if rf.commitIndex < rf.lastIncludedIndex {
+	if rf.commitIndex > rf.lastIncludedIndex {
 		rf.commitIndex = rf.lastIncludedIndex
 	}
-	if rf.lastApplied < rf.lastIncludedIndex {
+	if rf.lastApplied > rf.lastIncludedIndex {
 		rf.lastApplied = rf.lastIncludedIndex
 	}
 	raftState := rf.persister.ReadRaftState()
@@ -380,8 +385,8 @@ func (rf *Raft) SendInstallSnapshotToFollower(server int, args InstallSnapshotAr
 	defer func() {
 		if !rf.killed() {
 			rf.mu.Unlock()
-			ch <- struct{}{}
 		}
+		ch <- struct{}{}
 	}()
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -510,30 +515,29 @@ func (rf *Raft) Broadcast() {
 }
 
 func (rf *Raft) Apply() {
-	ok := rf.applyMu.TryLock()
-	if !ok {
-		// DPrintf("%v 已经开始 Apply", rf.me)
-		return
+	
+	rf.mu.Lock()
+	arrayMsg := []ApplyMsg{}
+	for rf.lastApplied < rf.commitIndex && rf.GetRealIndex(rf.lastApplied+1) > 0 {
+		rf.lastApplied += 1
+		arrayMsg = append(arrayMsg, ApplyMsg{
+			CommandValid:  true,
+			SnapshotValid: false,
+			CommandIndex:  rf.lastApplied,
+			Command:       rf.logEntries[rf.GetRealIndex(rf.lastApplied)].Command,
+		})
 	}
-	// DPrintf("%v 开始 apply", rf.me)
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.lastApplied >= rf.commitIndex {
-			rf.mu.Unlock()
-			break
-		}
-		rf.lastApplied++
-		ApplyMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.logEntries[rf.GetRealIndex(rf.lastApplied)].Command,
-			CommandIndex: rf.lastApplied,
-		}
-		// DPrintf("%v 提交 %v %v", rf.me, hashToNumber(rf.logEntries[rf.GetRealIndex(rf.lastApplied)].Command), rf.lastApplied)
-		rf.mu.Unlock()
-		rf.applyCh <- ApplyMsg
+	// DPrintf("%v 提交 %v %v", rf.me, hashToNumber(rf.logEntries[rf.GetRealIndex(rf.lastApplied)].Command), rf.lastApplied)
+	rf.mu.Unlock()
+	rf.applyMu.Lock()
+	DPrintf("%v 发送", rf.me)
+	for _, messages := range arrayMsg {
+		DPrintf("%v: %v", rf.me, messages)
+		rf.applyCh <- messages
 	}
-	// DPrintf("%v 完成 apply", rf.me)
 	rf.applyMu.Unlock()
+	DPrintf("%v 发送完毕", rf.me)
+	// DPrintf("%v 完成 apply", rf.me)
 }
 
 //
@@ -620,6 +624,16 @@ func (rf *Raft) GetLogLen() int {
 	return len
 }
 
+func (rf *Raft) LockGetLogLen() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	len := len(rf.logEntries)
+	if rf.lastIncludedIndex != -1 {
+		return len + rf.lastIncludedIndex
+	}
+	return len
+}
+
 func (rf *Raft) AppendEntriesToFollower(server int) {
 	defer func() {
 		if !rf.killed() {
@@ -634,7 +648,6 @@ func (rf *Raft) AppendEntriesToFollower(server int) {
 		}
 		// DPrintf("%v 发送给 %v nextIndex: %v lastIncludedIndex: %v \nLogEntry: %v  ", rf.me, server, rf.nextIndex[server], rf.lastIncludedIndex, getNumberLog(rf.logEntries))
 		lastNextIndex := rf.nextIndex[server]
-		lastIndex := rf.GetLastIndex()
 		if rf.GetRealIndex(lastNextIndex-1) < 0 {
 			args := InstallSnapshotArgs{
 				TermId:            rf.currentTerm,
@@ -649,6 +662,7 @@ func (rf *Raft) AppendEntriesToFollower(server int) {
 			<-ch
 			continue
 		}
+		lastIndex := rf.GetLastIndex()
 		sendIndex := rf.nextIndex[server] - 1
 		args := AppendEntriesArgs{
 			TermId:         rf.currentTerm,
@@ -681,6 +695,7 @@ func (rf *Raft) AppendEntriesToFollower(server int) {
 			if rf.matchIndex[server] < lastIndex {
 				rf.matchIndex[server] = lastIndex
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
+				DPrintf("%v 收到 %v 心跳回复sucessful lastIndex: %v", rf.me, server, lastIndex)
 			}
 			break
 		} else if rf.nextIndex[server] == lastNextIndex {
@@ -706,7 +721,7 @@ func (rf *Raft) AppendEntriesToFollower(server int) {
 	if minMatchIndex > rf.GetLogLen() {
 		minMatchIndex = rf.GetLogLen()
 	}
-	// DPrintf("%v 发送 %v 完毕, minMatchIndex: %v commitIndex: %v", rf.me, server, minMatchIndex, rf.commitIndex)
+	DPrintf("%v 发送 %v 完毕, minMatchIndex: %v commitIndex: %v", rf.me, server, minMatchIndex, rf.commitIndex)
 	if (rf.GetRealIndex(minMatchIndex) < 0 || rf.logEntries[rf.GetRealIndex(minMatchIndex)].TermId == rf.currentTerm) && minMatchIndex > rf.commitIndex {
 		rf.commitIndex = minMatchIndex
 	}

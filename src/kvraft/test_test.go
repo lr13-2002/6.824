@@ -385,7 +385,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 	} else if res == porcupine.Unknown {
 		fmt.Println("info: linearizability check timed out, assuming history is ok")
 	}
-
+	DPrintf("测试结束")
 	cfg.end()
 }
 
