@@ -897,7 +897,9 @@ func internalChurn(t *testing.T, unreliable bool) {
 				rf := cfg.rafts[i]
 				cfg.mu.Unlock()
 				if rf != nil {
+					DPrintf("cfn: %v start %v", me, i)
 					index1, _, ok1 := rf.Start(x)
+					DPrintf("cfn: %v start %v sucessful", me, i)
 					if ok1 {
 						ok = ok1
 						index = index1

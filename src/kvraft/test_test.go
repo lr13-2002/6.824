@@ -43,7 +43,9 @@ func (log *OpLog) Read() []porcupine.Operation {
 // get/put/putappend that keep counts
 func Get(cfg *config, ck *Clerk, key string, log *OpLog, cli int) string {
 	start := time.Now().UnixNano()
+	DPrintf("test GET key:%v", key)
 	v := ck.Get(key)
+	DPrintf("test GET sucessful key:%v, value:%v", key, v)
 	end := time.Now().UnixNano()
 	cfg.op()
 	if log != nil {
@@ -63,6 +65,7 @@ func Put(cfg *config, ck *Clerk, key string, value string, log *OpLog, cli int) 
 	start := time.Now().UnixNano()
 	DPrintf("test PUT key:%v, value:%v", key, value)
 	ck.Put(key, value)
+	DPrintf("test PUT sucessful key:%v, value:%v", key, value)
 	end := time.Now().UnixNano()
 	cfg.op()
 	if log != nil {
@@ -78,7 +81,9 @@ func Put(cfg *config, ck *Clerk, key string, value string, log *OpLog, cli int) 
 
 func Append(cfg *config, ck *Clerk, key string, value string, log *OpLog, cli int) {
 	start := time.Now().UnixNano()
+	DPrintf("test Append key:%v, value:%v", key, value)
 	ck.Append(key, value)
+	DPrintf("test Append sucessful key:%v, value:%v", key, value)
 	end := time.Now().UnixNano()
 	cfg.op()
 	if log != nil {

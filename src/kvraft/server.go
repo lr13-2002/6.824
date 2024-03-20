@@ -155,7 +155,7 @@ func (kv *KVServer) ListenApply() {
 					kv.reqId[args.ClerkId] = args.ReqId
 					kv.mu.Unlock()
 				}
-				if kv.rf.GetRaftSize() > kv.maxraftstate {
+				if kv.rf.GetRaftSize() > kv.maxraftstate && kv.maxraftstate != -1 {
 					DPrintf("%v 发送快照 CommandIndex:%v, loglen:%v", kv.me, val.CommandIndex, kv.rf.LockGetLogLen())
 					kv.rf.Snapshot(val.CommandIndex, kv.PersistSnapShot())
 					kv.mu.Lock()
@@ -187,7 +187,7 @@ func (kv *KVServer) InstallSnapshot() {
 		kv.mu.Lock()
 		lastSnapShot := kv.lastSnapShot
 		kv.mu.Unlock()
-		if kv.rf.GetRaftSize() > kv.maxraftstate {
+		if kv.rf.GetRaftSize() > kv.maxraftstate && kv.maxraftstate != -1  {
 			DPrintf("%v 发送快照 CommandIndex:%v, loglen:%v", kv.me, lastSnapShot, kv.rf.LockGetLogLen())
 			kv.rf.Snapshot(lastSnapShot, kv.PersistSnapShot())
 		}
