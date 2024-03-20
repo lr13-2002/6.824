@@ -298,5 +298,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastSnapShot = -1
 	// You may need initialization code here.
 	go kv.ListenApply()
+	if kv.maxraftstate != -1 {
+		go kv.InstallSnapshot()
+	}
 	return kv
 }
